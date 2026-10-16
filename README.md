@@ -2,6 +2,10 @@
 
 A screensaver for Steam's Big Picture mode that plays [Dwitter](https://www.dwitter.net) dweets, the tiny JavaScript animations, full screen and switches to a new random one every minute. It works offline: the dweets come from a database file that you download once. (Note: You alone are responsible for what appears on your TV while using this screensaver)
 
+
+https://github.com/user-attachments/assets/c75cde27-7089-45cd-976a-5443a04c8afd
+
+
 **Status:** working on a Steam Machine running SteamOS. Steam Deck and Windows use the same folder layout, but have not been tried.
 
 ## Quick start
