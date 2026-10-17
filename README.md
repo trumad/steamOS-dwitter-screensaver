@@ -6,7 +6,7 @@ A screensaver for Steam's Big Picture mode that plays [Dwitter](https://www.dwit
 https://github.com/user-attachments/assets/c75cde27-7089-45cd-976a-5443a04c8afd
 
 
-**Status:** working on a Steam Machine running SteamOS. Steam Deck and Windows use the same folder layout, but have not been tried. If some dweets cause the any kind of crashing, please open an issue.
+**Status:** working on a Steam Machine running SteamOS. Steam Deck and Windows use the same folder layout, but have not been tried. If some dweets cause any kind of crashing, please open an issue.
 
 ## Quick start
 
