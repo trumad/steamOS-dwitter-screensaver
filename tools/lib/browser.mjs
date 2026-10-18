@@ -151,7 +151,9 @@ export async function launchBrowser(options = {}) {
         `--user-data-dir=${profile}`,
         "--no-first-run",
         "--no-default-browser-check",
-        "--disable-gpu",
+        // Software compositing unless gpu is asked for. The GPU path is what a real browser (and Steam's) uses, and it has
+        // bugs that the software path does not: see rule 11 in AGENTS.md.
+        ...(options.gpu ? [] : ["--disable-gpu"]),
         "--hide-scrollbars",
         "--mute-audio",
         "--enable-precise-memory-info",

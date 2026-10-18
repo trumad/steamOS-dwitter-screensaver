@@ -2,11 +2,7 @@
 
 A screensaver for Steam's Big Picture mode that plays [Dwitter](https://www.dwitter.net) dweets, the tiny JavaScript animations, full screen and switches to a new random one every minute. It works offline: the dweets come from a database file that you download once. (Note: You alone are responsible for what appears on your TV while using this screensaver)
 
-
-https://github.com/user-attachments/assets/c75cde27-7089-45cd-976a-5443a04c8afd
-
-
-**Status:** working on a Steam Machine running SteamOS. Steam Deck and Windows use the same folder layout, but have not been tried. If some dweets cause any kind of crashing, please open an issue.
+**Status:** working on a Steam Machine running SteamOS. Steam Deck and Windows use the same folder layout, but have not been tried.
 
 ## Quick start
 
@@ -66,7 +62,8 @@ Everything is in `config.js`, in the installed folder (for example `~/.steam/roo
 | `INCLUDE` | `["MIN_LIKES_20", "CUSTOM"]` | Which dweets may be shown, see below. |
 | `EXCLUDE` | `[]` | Dweets to leave out; same syntax as `INCLUDE`. |
 | `ROTATE_SECONDS` | `60` | Seconds before the next dweet (minimum 5). `0` = never switch. |
-| `TRANSITION_MS` | `500` | Cross-fade between dweets. `0` = hard cut. |
+| `TRANSITION_MS` | `2000` | How long the change from one dweet to the next takes, in milliseconds: the picture fades out to black over the first half, and the next one fades in over the second half. `0` = hard cut. The dweet that is leaving keeps running while it fades. |
+| `PRELOAD_SECONDS` | `5` | How long the next dweet runs out of sight, underneath the one on screen, before it is shown, so that it is already underway. Many dweets start from an empty canvas and take a few seconds to build their picture; without this you would see the empty canvas first. `0` = show each dweet as soon as it has started. It is cut down when `ROTATE_SECONDS` is short. |
 | `MIN_FPS` | `30` | Dweets that run slower than this on your device are skipped. `0` = never skip. |
 | `FLASH_GUARD` | `true` | Skip dweets that flash rapidly (see [Safety](#safety)). |
 | `EXCLUDE_INTERACTIVE` | `true` | Skip dweets that wait for mouse, keyboard or touch, or that play sound. |
@@ -119,7 +116,8 @@ Add them to `custom-dweets.js`: give each an `id` (any unique text) and its code
 
 - Each dweet runs in its own sandboxed frame, played by a port of Dwitter's own player, so it looks the way it does on dwitter.net: a 1920x1080 canvas, 60 frames per second, and the same `c`, `x`, `S`, `C`, `T`, `R`, `t` and `frame`.
 - A new dweet is picked every `ROTATE_SECONDS`. The order is a shuffle that shows every dweet in the pool once before repeating, remembered between sessions, and it keeps the same author (within 3 dweets) and the same remix family (within 10) apart.
-- The next dweet warms up behind the current one and fades in once it has drawn something.
+- The next dweet is loaded `PRELOAD_SECONDS` before it is due and runs out of sight, underneath the one on screen, so that it is already underway when it appears. Many dweets start from an empty canvas and take a few seconds to build their picture (about one in four shows less than half of it after the first half second), and without this you would see that empty canvas first.
+- The change from one dweet to the next dips through black: the picture fades out over the first half of `TRANSITION_MS` (the old dweet keeps running meanwhile), the two dweets are swapped while the screen is dark, and the next one fades in over the second half. It is deliberately not a cross-fade between the two. Browsers that draw with the GPU, which includes the one in Steam, paint a cross-origin frame that is partly transparent on top of a solid white background, so a frame that is fading in, or that waits at 1% opacity, turns the whole screen white. A plain black sheet over the frames has no such problem, and a waiting frame is simply hidden underneath the one on screen.
 - Every dweet is credited on screen: its author and, for dweets from the database, its dwitter.net address ("by KilledByAPixel · dwitter.net/d/36024"). The text is white with a dark outline, which stays readable over whatever the dweet draws. `ATTRIBUTION_POSITION` picks the corner or switches it off. A line of text that stays lit in one spot can burn into an OLED screen, so for those set it to `RANDOM`: every dweet then gets a different place (never the same twice in a row), and the credit only moves while it is faded out. `OFF` is the other safe choice.
 - **Nothing is fetched from the internet while it runs.** The only requests the page makes are for the files in its own folder (`main.js`, `dweets.js` and so on). Steam serves those from a made-up host name, see [Error Code: -105](#error-code--105).
 
@@ -130,7 +128,7 @@ Dweets are other people's programs, and so is the database file, so the screensa
 - **Sandboxed dweets:** a dweet cannot reach the screensaver page or anything Steam exposes to it, cannot load anything from the network (requests, scripts, images), and cannot store anything. A dweet that tries to send its frame somewhere else, or floods the page with messages, is removed at once, and dweets that navigate away or use the network are never picked in the first place (`IDS_` can still ask for one by name).
 - **The database is read as data:** `dweets.js` is a JavaScript file that somebody else produced, but the dump is just a list of plain JSON entries behind `let dweets =`. The screensaver reads it as text and parses it, so nothing in the file is ever run. A file with anything else in it is not used, and you get a hint. Only where a file cannot be fetched at all (for example when `index.html` is opened straight from the file system) is it run as a script instead, unless you set `DATABASE_MODE: "data"`. `DATABASE_MODE: "direct"` always runs it, for a file that is not plain data.
 - **Skipped while playing:** dweets that fail to compile or throw on every frame, draw nothing (or hide their canvas), run slower than `MIN_FPS` on your device, or flash. A dweet on screen that stops responding is replaced. `dwitter/blocklist.js` lists ones found to be bad in advance.
-- **The flash check is a heuristic.** It looks at the average brightness of the whole picture, modelled on the WCAG rule of at most three flashes per second. It can miss flashing that covers only part of the screen. If you or anyone who watches is sensitive to flashing, do not rely on it: pick a small, hand-checked set, for example `INCLUDE: "IDS_..."`, and look at it first.
+- **The flash check is a heuristic.** It looks at the average brightness of the whole picture, modelled on the WCAG rule of at most three flashes per second. It can miss flashing that covers only part of the screen. Because the next dweet runs out of sight for `PRELOAD_SECONDS` first, a dweet that flashes from the start is usually caught before it is ever shown. If you or anyone who watches is sensitive to flashing, do not rely on it: pick a small, hand-checked set, for example `INCLUDE: "IDS_..."`, and look at it first.
 - A dweet that contains an endless loop can still freeze the screensaver until it is dismissed, because it shares a process with the page (whether Steam separates them is not something the screensaver can control). If you find one, note its id (set `DEBUG: true`) and add it to `EXCLUDE`.
 
 ## Troubleshooting
@@ -147,6 +145,8 @@ Valve does not document the screensaver format. This project follows what Valve'
 - **I do not like a dweet:** set `DEBUG: true`, note its id, and add `"IDS_<id>"` to `EXCLUDE`.
 - **A dweet looks different from dwitter.net, or is hard to see:** set `BACKGROUND_COLOR` back to `"white"`, which is how Dwitter shows dweets.
 - **Too many repeats:** widen `INCLUDE`, for example `"MIN_LIKES_10"` or `"ALL"`.
+- **The screen is too bright, or jumps, when the dweet changes:** lengthen `TRANSITION_MS` (up to 5000). The screen always dips through black, so this spreads the change out.
+- **The picture stutters for a few seconds around a change:** two dweets are running at the same time then (for `PRELOAD_SECONDS` out of sight, and for half of `TRANSITION_MS` while the screen goes dark), which a slow device can feel. Lower `PRELOAD_SECONDS`, or set it to `0`.
 - **Changes to `config.js` are ignored:** close and reopen the screensaver, then restart Steam. Look for a hint that names a mistake in the file.
 
 ### Error Code: -105
@@ -190,7 +190,7 @@ python3 -m http.server --directory dwitter 8000     # then open http://localhost
 
 | File | Purpose |
 | --- | --- |
-| `index.html`, `main.css`, `main.js` | the screensaver: stage, database, rotation, cross-fade, hints |
+| `index.html`, `main.css`, `main.js` | the screensaver: stage, database, rotation, the change between dweets, hints |
 | `config.js` | settings |
 | `selection.js` | `INCLUDE`/`EXCLUDE` presets, shuffle order (also used by the tools) |
 | `health.js` | checks on a playing dweet: errors, blank, slow, flashing (also used by the tools) |

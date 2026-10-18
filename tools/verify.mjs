@@ -8,7 +8,8 @@
 //   node tools/verify.mjs --soak                   rotation soak test: many fast rotations, watching memory
 //   node tools/verify.mjs --help
 import { createRequire } from "node:module";
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
@@ -241,7 +242,13 @@ async function runSoak(args) {
     });
     const include = args.include || "TOP_40";
     const poolSize = Selection.resolve(db, { INCLUDE: include.split("|") }, { excludeInteractive: true }).pool.length;
-    const server = await startServer(siteDir);
+    // The shipped cross-fade is longer than the 2 s between rotations here, which would leave no room to pre-load. A short
+    // fade and a 1 s pre-load keep the pace and still go through the whole path: a dweet waiting out of sight, then fading
+    // in over one that is still running.
+    const soakDir = mkdtempSync(path.join(os.tmpdir(), "dwitter-soak-"));
+    cpSync(siteDir, soakDir, { recursive: true });
+    writeFileSync(path.join(soakDir, "config.js"), "const CONFIG = { TRANSITION_MS: 500, PRELOAD_SECONDS: 1 };\n");
+    const server = await startServer(soakDir);
     const browser = await launchBrowser({ chrome: args.chrome });
     const samples = [];
     try {
@@ -288,6 +295,7 @@ async function runSoak(args) {
     } finally {
         await browser.close();
         await server.close();
+        rmSync(soakDir, { recursive: true, force: true });
     }
 }
 

@@ -22,10 +22,19 @@ const CONFIG = {
     EXCLUDE: [],
 
     // Seconds each dweet is shown before the next one starts (minimum 5). 0 = never switch.
-    ROTATE_SECONDS: 60,
+    ROTATE_SECONDS: 6,
 
-    // Cross-fade between dweets, in milliseconds. 0 = hard cut.
-    TRANSITION_MS: 500,
+    // How long the change from one dweet to the next takes, in milliseconds: the picture fades out to black over the first
+    // half, and the next one fades in over the second half. 0 = hard cut. The dweet that is leaving keeps running while it
+    // fades. (It is not a cross-fade: a browser that draws with the GPU, such as the one in Steam, paints a frame that is
+    // partly transparent on top of solid white, so fading one frame over another turns the screen white.)
+    TRANSITION_MS: 2000,
+
+    // The next dweet is loaded early and runs out of sight, underneath the one on screen, for this many seconds before it
+    // is shown. Many dweets start from an empty canvas and take a few seconds to build up their picture; without this,
+    // you would see that empty canvas first. 0 = show each dweet as soon as it has started. It is cut down automatically
+    // when ROTATE_SECONDS is short.
+    PRELOAD_SECONDS: 5,
 
     // Dweets that run slower than this many frames per second on your device are skipped. 0 = never skip.
     MIN_FPS: 30,

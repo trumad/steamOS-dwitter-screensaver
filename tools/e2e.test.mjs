@@ -7,7 +7,10 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { inflateSync } from "node:zlib";
+import { createRequire } from "node:module";
 import { findChrome, launchBrowser, startServer } from "./lib/browser.mjs";
+
+const Selection = createRequire(import.meta.url)("../dwitter/selection.js");
 
 const siteDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "dwitter");
 let skip = false;
@@ -122,7 +125,7 @@ test("a pinned dweet is shown and keeps running at full speed", { skip }, async 
     await tab.close();
 });
 
-test("dweets rotate, with at most two frames alive during a cross-fade", { skip }, async () => {
+test("dweets rotate, with at most two frames alive during a change", { skip }, async () => {
     const { tab } = await open(makeSite("rotation"), "debug=1&rotate=2&include=" + encodeURIComponent("IDS_good-a,good-b,good-c"));
     const seen = new Set();
     let maxFrames = 0;
@@ -137,9 +140,11 @@ test("dweets rotate, with at most two frames alive during a cross-fade", { skip 
     await tab.close();
 });
 
-for (const [bad, reason] of [["bad-syntax", "compile-error"], ["bad-runtime", "runtime-error"], ["blank", "blank"], ["no-canvas", "blank"], ["slow", "slow"]]) {
+// The speed check only starts a few seconds after a dweet is shown, so a slow dweet has to stay on screen for longer
+// than the others need to be rejected.
+for (const [bad, reason, rotate] of [["bad-syntax", "compile-error", 2], ["bad-runtime", "runtime-error", 2], ["blank", "blank", 2], ["no-canvas", "blank", 2], ["slow", "slow", 9]]) {
     test(`a ${bad} dweet is skipped (${reason}) and never stays on screen`, { skip }, async () => {
-        const { tab } = await open(makeSite("skip-" + bad), "debug=1&rotate=2&include=" + encodeURIComponent(`IDS_${bad},good-a,good-b`));
+        const { tab } = await open(makeSite("skip-" + bad), `debug=1&rotate=${rotate}&include=` + encodeURIComponent(`IDS_${bad},good-a,good-b`));
         const shownBad = [];
         await until("the bad dweet to be rejected", async () => {
             const s = await snapshot(tab);
@@ -324,7 +329,7 @@ test("a missing database shows a hint and falls back to the custom dweets", { sk
 });
 
 test("a bad value in config.js is reported and replaced by the default", { skip }, async () => {
-    const config = 'const CONFIG = { ROTATE_SECONDS: "fast", FIT: "wide", INCLUDE: "TOPP_5", ATTRIBUTION_POSITION: "middle-ish", BACKGROUND_COLOR: "not-a-colour" };\n';
+    const config = 'const CONFIG = { ROTATE_SECONDS: "fast", FIT: "wide", INCLUDE: "TOPP_5", ATTRIBUTION_POSITION: "middle-ish", BACKGROUND_COLOR: "not-a-colour", PRELOAD_SECONDS: -2 };\n';
     const { tab } = await open(makeSite("bad-config", { config, custom: CUSTOM.slice(0, 3) }), "debug=1");
     await until("the hint", async () => tab.evaluate("!document.getElementById('hint').hidden"));
     const hint = await tab.evaluate("document.getElementById('hint').textContent");
@@ -332,6 +337,7 @@ test("a bad value in config.js is reported and replaced by the default", { skip 
     assert.match(hint, /FIT/);
     assert.match(hint, /ATTRIBUTION_POSITION in config\.js should be TOP_LEFT, .*BOTTOM_RIGHT, RANDOM or OFF\. Using "BOTTOM_LEFT"/);
     assert.match(hint, /BACKGROUND_COLOR in config\.js should be a CSS colour.* Using "white"/);
+    assert.match(hint, /PRELOAD_SECONDS in config\.js should be between 0 and 60\. Using 5\./);
     assert.match(hint, /Unknown preset "TOPP_5"/);
     const snap = await until("a dweet from the default selection", async () => {
         const s = await snapshot(tab);
@@ -621,23 +627,61 @@ const BG_PROBE = {
 
 const probeReports = async (tab) => JSON.parse(await tab.evaluate("JSON.stringify(window.__dwitter.log.filter(e => e.msg.type === 'probe').map(e => e.msg.what))"));
 
-// The colour of one point of the page as the screen shows it: a 1x1 screenshot, decoded.
-async function pixelAt(tab, x, y) {
-    const { data } = await tab.send("Page.captureScreenshot", { format: "png", clip: { x, y, width: 1, height: 1, scale: 1 } }, 10000);
+// What the screen shows, as pixels: a screenshot of an area, decoded to red, green and blue bytes (and alpha, if the
+// screenshot has it).
+async function pixels(tab, clip) {
+    const { data } = await tab.send("Page.captureScreenshot", { format: "png", clip: Object.assign({ scale: 1 }, clip) }, 10000);
     const png = Buffer.from(data, "base64");
+    let width = 0;
+    let height = 0;
+    let channels = 3;
     const parts = [];
     for (let pos = 8; pos < png.length;) {
         const length = png.readUInt32BE(pos);
-        if (png.toString("latin1", pos + 4, pos + 8) === "IDAT") parts.push(png.subarray(pos + 8, pos + 8 + length));
+        const type = png.toString("latin1", pos + 4, pos + 8);
+        if (type === "IHDR") {
+            width = png.readUInt32BE(pos + 8);
+            height = png.readUInt32BE(pos + 12);
+            channels = png[pos + 17] === 6 ? 4 : 3; // colour type 6 is red, green, blue and alpha
+        } else if (type === "IDAT") {
+            parts.push(png.subarray(pos + 8, pos + 8 + length));
+        }
         pos += length + 12;
     }
-    // The first row starts with its filter byte, and the first pixel of a row is stored as it is: red, green, blue.
-    const row = inflateSync(Buffer.concat(parts));
-    return [row[1], row[2], row[3]];
+    const raw = inflateSync(Buffer.concat(parts));
+    const stride = width * channels;
+    const out = Buffer.alloc(height * stride);
+    for (let y = 0; y < height; y++) {
+        const filter = raw[y * (stride + 1)];
+        for (let x = 0; x < stride; x++) {
+            const left = x >= channels ? out[y * stride + x - channels] : 0;
+            const up = y ? out[(y - 1) * stride + x] : 0;
+            const upLeft = y && x >= channels ? out[(y - 1) * stride + x - channels] : 0;
+            let value = raw[y * (stride + 1) + 1 + x];
+            if (filter === 1) value += left;
+            else if (filter === 2) value += up;
+            else if (filter === 3) value += (left + up) >> 1;
+            else if (filter === 4) {
+                const guess = left + up - upLeft;
+                const distLeft = Math.abs(guess - left);
+                const distUp = Math.abs(guess - up);
+                const distUpLeft = Math.abs(guess - upLeft);
+                value += distLeft <= distUp && distLeft <= distUpLeft ? left : distUp <= distUpLeft ? up : upLeft;
+            }
+            out[y * stride + x] = value & 255;
+        }
+    }
+    return { width, height, channels, data: out };
 }
 
-test("by default the canvas and the page around it are white", { skip }, async () => {
-    const { tab } = await open(makeSite("background-default", { extraCustom: [BG_PROBE] }), "rotate=0&id=bg-probe");
+// The colour of one point of the page as the screen shows it.
+async function pixelAt(tab, x, y) {
+    const shot = await pixels(tab, { x, y, width: 1, height: 1 });
+    return [shot.data[0], shot.data[1], shot.data[2]];
+}
+
+test("with no setting, the canvas and the page around it are white", { skip }, async () => {
+    const { tab } = await open(makeSite("background-default", { config: "const CONFIG = {};\n", extraCustom: [BG_PROBE] }), "rotate=0&id=bg-probe");
     const reports = await until("the dweet to report back", async () => {
         const r = await probeReports(tab);
         return r.length >= 2 && r;
@@ -732,4 +776,232 @@ test("CANVAS_BACKGROUND, the old name of the setting, still works, and BACKGROUN
         assert.equal(await tab.evaluate("document.getElementById('hint').hidden"), true, name + " is valid, so there is no hint");
         await tab.close();
     }
+});
+
+// Dweets for the transition tests.
+const DARK = { id: "dark", username: "t1", code: 'x.fillStyle="#000";x.fillRect(0,0,1920,1080)' };
+// Starts from an empty canvas and adds one more black bar every frame: all black after about 2.5 seconds.
+const BUILDER = { id: "builder", username: "t2", code: 'x.fillStyle="#000";x.fillRect(frame*13%1920,0,13,1080)' };
+// A black block that moves across a white canvas, 12 pixels a frame.
+const MOVER = { id: "mover", username: "t3", code: 'c.width=1920;x.fillStyle="#000";x.fillRect(frame*12%1800,400,100,200)' };
+const GREY = { id: "grey", username: "t4", code: 'x.fillStyle="#808080";x.fillRect(0,0,1920,1080)' };
+// Black for the first `frames` frames, then flashing black and white.
+const flashAfter = (frames) => ({
+    id: "flash-" + frames,
+    username: "t5",
+    code: `c.width=1920;x.fillStyle=frame>${frames}&&(frame>>3)%2?"#fff":"#000";x.fillRect(0,0,1920,1080)`,
+});
+
+// The order of the dweets comes from Math.random. This finds a value for it that makes the screensaver start with `first`
+// when it shows `ids`, and returns what to give open() as beforeLoad.
+function startWith(first, ids, extraCustom = []) {
+    const db = Selection.buildDatabase({ dweets: null, custom: [...CUSTOM, ...extraCustom], blocklist: {} });
+    const { pool } = Selection.resolve(db, { INCLUDE: ["IDS_" + ids.join(",")], EXCLUDE: [] }, { excludeInteractive: true });
+    for (let i = 1; i < 100; i++) {
+        const rec = Selection.createOrder(pool, { rng: () => i / 100 }).next();
+        if (rec && String(rec.id) === first) {
+            return (tab) => tab.send("Page.addScriptToEvaluateOnNewDocument", { source: "Math.random = () => " + i / 100 });
+        }
+    }
+    throw new Error("no order of " + ids.join(", ") + " starts with " + first);
+}
+
+// Follows the screen until done(samples) says to stop: about ten times a second, which dweet is on screen and which is
+// waiting, and how bright the screen is (0 is black, 1 is white).
+async function watch(tab, done, timeoutMs = 40000) {
+    const view = JSON.parse(await tab.evaluate("JSON.stringify({ w: innerWidth, h: innerHeight })"));
+    const samples = [];
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+        const shot = await pixels(tab, { x: 0, y: 0, width: view.w, height: view.h, scale: 0.1 });
+        let sum = 0;
+        for (let i = 0; i < shot.data.length; i += shot.channels) sum += 0.2126 * shot.data[i] + 0.7152 * shot.data[i + 1] + 0.0722 * shot.data[i + 2];
+        const s = await snapshot(tab);
+        samples.push({
+            at: Date.now(),
+            booted: Boolean(s),
+            current: s && s.current,
+            pending: s && s.pending,
+            iframes: s ? s.iframes : 0,
+            curtain: s ? s.curtain : null,
+            brightness: sum / (shot.data.length / shot.channels) / 255,
+        });
+        if (done(samples)) return samples;
+        await sleep(30);
+    }
+    throw new Error("Timed out following the screen after " + samples.length + " looks");
+}
+
+test("a dweet that starts from an empty canvas is built up before it fades in, so the screen does not flash", { skip }, async () => {
+    const ids = ["dark", "builder"];
+    const config = "const CONFIG = { TRANSITION_MS: 500, PRELOAD_SECONDS: 4 };\n";
+    const { tab } = await open(makeSite("preload-builder", { config, extraCustom: [DARK, BUILDER] }), "debug=1&rotate=8&include=" + encodeURIComponent("IDS_" + ids.join(",")), {
+        beforeLoad: startWith("dark", ids, [DARK, BUILDER]),
+    });
+    const samples = await watch(tab, (all) => {
+        const first = all.findIndex((s) => s.current === "builder");
+        return first >= 0 && all[all.length - 1].at - all[first].at > 3500;
+    });
+    const brightness = samples.slice(samples.findIndex((s) => s.current === "builder")).map((s) => s.brightness);
+    // Shown after half a second, as it used to be, the builder is mostly empty (white) canvas: brightness 0.6 and more.
+    assert.ok(Math.max(...brightness) < 0.1, "the screen went bright: " + brightness.map((b) => b.toFixed(2)).join(" "));
+    await tab.close();
+});
+
+test("the dweet that is leaving keeps running while the screen goes dark", { skip }, async () => {
+    const ids = ["mover", "grey"];
+    // The screen goes dark over the first half of TRANSITION_MS (2 s here); the old dweet is removed when it is dark.
+    const config = "const CONFIG = { TRANSITION_MS: 4000, PRELOAD_SECONDS: 1 };\n";
+    const { tab } = await open(makeSite("dip-live", { config, extraCustom: [MOVER, GREY] }), "debug=1&rotate=6&include=" + encodeURIComponent("IDS_" + ids.join(",")), {
+        beforeLoad: startWith("mover", ids, [MOVER, GREY]),
+    });
+    await until("the grey dweet to take over", async () => (await snapshot(tab)).current === "grey", 30000);
+    // Where the black block is, in a thin row across the picture. The screen is only part of the way to black, so it shows.
+    const blockAt = async () => {
+        const frame = JSON.parse(await tab.evaluate(`JSON.stringify((() => { const r = document.querySelector("iframe").getBoundingClientRect(); return { x: r.left, y: r.top, w: r.width, h: r.height }; })())`));
+        const row = await pixels(tab, { x: frame.x, y: frame.y + frame.h * 0.46, width: frame.w, height: 1 });
+        let darkest = 0;
+        for (let i = 1; i < row.width; i++) if (row.data[i * row.channels] < row.data[darkest * row.channels]) darkest = i;
+        return darkest;
+    };
+    await sleep(300);
+    const first = await blockAt();
+    await sleep(600);
+    const second = await blockAt();
+    assert.ok(Math.abs(second - first) > 40, "the block did not move while the screen went dark (" + first + ", then " + second + "): the old dweet was stopped");
+    await tab.close();
+});
+
+test("the next dweet loads ahead of its turn and has been running for PRELOAD_SECONDS when it is shown", { skip }, async () => {
+    const config = "const CONFIG = { TRANSITION_MS: 500, PRELOAD_SECONDS: 3 };\n";
+    const { tab } = await open(makeSite("preload-timing", { config }), "debug=1&rotate=6&include=" + encodeURIComponent("IDS_good-a,good-b,good-c"));
+    const shown = [];
+    let waitingSince = null;
+    let maxIframes = 0;
+    let last = null;
+    const started = Date.now();
+    while (shown.length < 3 && Date.now() - started < 40000) {
+        const s = await snapshot(tab);
+        if (s) {
+            maxIframes = Math.max(maxIframes, s.iframes);
+            if (s.current && s.pending && waitingSince === null) waitingSince = Date.now();
+            if (s.current && s.current !== last) {
+                const frames = await tab.evaluate(`(() => { const m = window.__dwitter.log.filter((e) => e.id === ${JSON.stringify(s.current)} && e.msg.type === "stats"); return m.length ? m[m.length - 1].msg.frame : 0; })()`);
+                shown.push({ id: s.current, at: Date.now(), frames, waited: waitingSince === null ? 0 : Date.now() - waitingSince });
+                last = s.current;
+                waitingSince = null;
+            }
+        }
+        await sleep(50);
+    }
+    assert.equal(shown.length, 3, "three dweets should have been shown: " + JSON.stringify(shown));
+    for (const next of shown.slice(1)) {
+        assert.ok(next.waited >= 2500, "d/" + next.id + " should have been waiting for about 3 s, and had been for " + next.waited + " ms");
+        assert.ok(next.frames >= 3 * 60 * 0.8, "d/" + next.id + " had only run " + next.frames + " frames when it was shown");
+    }
+    // The pace is still one dweet every ROTATE_SECONDS.
+    assert.ok(Math.abs(shown[2].at - shown[1].at - 6000) < 1200, "the dweets were " + (shown[2].at - shown[1].at) + " ms apart");
+    assert.ok(maxIframes <= 2, "iframes alive at once: " + maxIframes);
+    assert.deepEqual(await failures(tab), []);
+    await tab.close();
+});
+
+test("when the dweet on screen is cut, the one waiting out of sight is shown at once", { skip }, async () => {
+    const ids = ["flash-120", "good-a"];
+    const extra = [flashAfter(120)];
+    const config = "const CONFIG = { TRANSITION_MS: 500, PRELOAD_SECONDS: 5 };\n";
+    const { tab } = await open(makeSite("preload-cut", { config, extraCustom: extra }), "debug=1&rotate=6&include=" + encodeURIComponent("IDS_" + ids.join(",")), {
+        beforeLoad: startWith("flash-120", ids, extra),
+    });
+    let waited = false;
+    let cutAt = null;
+    let replacedAt = null;
+    const started = Date.now();
+    while (replacedAt === null && Date.now() - started < 30000) {
+        const s = await snapshot(tab);
+        if (s && s.pending && cutAt === null) waited = true;
+        if (cutAt === null && (await failures(tab).catch(() => [])).some((f) => f.id === "flash-120" && f.reason === "flash")) cutAt = Date.now();
+        if (cutAt !== null && s && s.current === "good-a") replacedAt = Date.now();
+        await sleep(30);
+    }
+    assert.ok(cutAt !== null && replacedAt !== null, "the flashing dweet should have been cut and replaced");
+    assert.ok(waited, "the next dweet should have been waiting when the flashing one was cut");
+    assert.ok(replacedAt - cutAt < 1000, "the replacement came " + (replacedAt - cutAt) + " ms after the cut; it should have been waiting and shown at once");
+    await tab.close();
+});
+
+test("a flashing dweet that is still waiting out of sight is caught before anyone sees it", { skip }, async () => {
+    const ids = ["good-a", "flash-60"];
+    const extra = [flashAfter(60)];
+    const config = "const CONFIG = { TRANSITION_MS: 500, PRELOAD_SECONDS: 5 };\n";
+    const { tab } = await open(makeSite("preload-caught", { config, extraCustom: extra }), "debug=1&rotate=8&include=" + encodeURIComponent("IDS_" + ids.join(",")), {
+        beforeLoad: startWith("good-a", ids, extra),
+    });
+    const shown = new Set();
+    await until("the flashing dweet to be caught", async () => {
+        const s = await snapshot(tab);
+        if (s && s.current) shown.add(s.current);
+        return (await failures(tab)).some((f) => f.id === "flash-60" && f.reason === "flash");
+    }, 30000);
+    assert.deepEqual([...shown], ["good-a"], "the flashing dweet was on screen before it was caught");
+    await tab.close();
+});
+
+test("PRELOAD_SECONDS is cut down when ROTATE_SECONDS leaves no room for it", { skip }, async () => {
+    // With the shipped TRANSITION_MS of 2000: the dweet being replaced is gone half of that (1000 ms) plus 300 ms after its
+    // reveal, and the next one cannot start loading before then.
+    for (const [rotate, expected] of [["60", 5000], ["5", 3700], ["2", 700], ["0", 0]]) {
+        const { tab } = await open(makeSite("preload-room-" + rotate), `debug=1&rotate=${rotate}&include=IDS_good-a,good-b`);
+        const snap = await until("the screensaver to start", async () => {
+            const s = await snapshot(tab);
+            return s && s.current && s;
+        });
+        assert.equal(snap.preloadMs, expected, "ROTATE_SECONDS " + rotate);
+        await tab.close();
+    }
+});
+
+// A browser that composes with the GPU draws a cross-origin frame that is partly transparent on top of an opaque white
+// background (AGENTS.md, rule 11): a frame waiting at 1% opacity, or fading in, turned the whole screen white, which is
+// what was seen on a Steam Machine. The usual test browser uses software compositing, where that does not happen, so this
+// one starts a browser with the GPU on.
+test("with GPU compositing, a dweet that waits out of sight is never seen and a change never goes white", { skip }, async () => {
+    const gpu = await launchBrowser({ gpu: true });
+    extraBrowsers.push(gpu);
+    const ids = ["dark", "grey"];
+    const config = 'const CONFIG = { TRANSITION_MS: 500, PRELOAD_SECONDS: 3, ATTRIBUTION_POSITION: "OFF" };\n';
+    const server = await startServer(makeSite("gpu-compositing", { config, extraCustom: [DARK, GREY] }));
+    servers.push(server);
+    const url = `${server.url}/index.html?debug=1&rotate=6&include=` + encodeURIComponent("IDS_" + ids.join(","));
+    const pinOrder = startWith("dark", ids, [DARK, GREY]);
+
+    // The first dweet waits under the curtain, with nothing else on screen changing, and has to start by itself: a frame
+    // that is hidden behind something fully opaque is not given animation frames. (Nothing here takes a screenshot, which
+    // would make the browser paint.)
+    const first = await gpu.newTab(null);
+    await pinOrder(first);
+    await first.goto(url);
+    await until("the first dweet to start by itself", async () => {
+        const s = await snapshot(first);
+        return s && s.current === "dark";
+    }, 15000);
+    await first.close();
+
+    const tab = await gpu.newTab(null);
+    await pinOrder(tab);
+    await tab.goto(url);
+    // From the start, until the dweet after next is on screen: dark, grey, dark.
+    const samples = (await watch(tab, (all) => {
+        const order = [];
+        for (const s of all) if (s.current && s.current !== order[order.length - 1]) order.push(s.current);
+        return order.length >= 3 && all[all.length - 1].at - all.find((s) => s.current === order[2]).at > 1500;
+    })).filter((s) => s.booted);
+    const brightest = Math.max(...samples.map((s) => s.brightness));
+    // The grey dweet is 0.44 on this scale and white is 0.87.
+    assert.ok(brightest < 0.5, "the screen went brighter than any dweet (" + brightest.toFixed(2) + "): a waiting or changing frame was drawn white");
+    const hidden = samples.filter((s) => s.current === "dark" && s.pending === "grey");
+    assert.ok(hidden.length > 10, "the grey dweet should have waited under the dark one for a while");
+    assert.ok(Math.max(...hidden.map((s) => s.brightness)) < 0.05, "the dweet that waits behind the dark one was visible");
+    assert.ok(Math.max(...samples.map((s) => s.curtain)) < 1, "the curtain must never be fully opaque: the frames behind it would stop");
+    await tab.close();
 });

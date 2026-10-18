@@ -22,27 +22,17 @@ html, body {
     place-items: center;
 }
 
-/* Each dweet is drawn 16:9 by the player. Later frames sit on top of earlier ones, so a new dweet fades in over
-   the one it replaces.
-   A frame that is warming up must not be fully transparent: Chrome stops painting (and slows requestAnimationFrame
-   to a crawl in) cross-origin frames at opacity 0, so it waits at 1% instead, which cannot be seen. */
+/* Each dweet is drawn 16:9 by the player. All the frames sit in the same place; main.js keeps the one on screen above
+   the one that waits (z-index) and never makes a frame translucent: with GPU compositing (which is what a console's
+   browser uses), a cross-origin frame that is partly transparent, or inside something that is, is drawn on top of an
+   opaque white background. A waiting frame at 1% opacity, or a frame fading in, turns the whole screen white. The change
+   from one dweet to the next is done with a black sheet instead (the curtain, see main.js). */
 .dweet {
     grid-area: 1 / 1;
     border: 0;
     width: min(100vw, calc(100vh * 16 / 9));
     aspect-ratio: 16 / 9;
-    opacity: 0.01;
-    transition: opacity var(--fade, 500ms) ease-in-out;
     pointer-events: none;
-}
-
-.dweet.visible {
-    opacity: 1;
-}
-
-.dweet.cut {
-    opacity: 0;
-    transition: none;
 }
 
 body.cover .dweet {

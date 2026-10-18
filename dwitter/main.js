@@ -5,7 +5,8 @@
         INCLUDE: ["MIN_LIKES_20", "CUSTOM"],
         EXCLUDE: [],
         ROTATE_SECONDS: 60,
-        TRANSITION_MS: 500,
+        TRANSITION_MS: 2000,
+        PRELOAD_SECONDS: 5,
         MIN_FPS: 30,
         FLASH_GUARD: true,
         EXCLUDE_INTERACTIVE: true,
@@ -24,6 +25,9 @@
     const READ_TIMEOUT_MS = 15000;   // how long to wait for the database to be read
     const NOTHING_MS = 30000;        // nothing on screen after this long: say how to find out why
     const STALL_MS = 10000;          // a dweet on screen that has reported nothing for this long is replaced
+    const FADE_MARGIN_MS = 300;      // from the dweet that was replaced being removed to the next one starting to load
+    const CREDIT_MARGIN_MS = 50;     // from a credit having faded out to the next one being put there
+    const HOLD_STALL_MS = 3000;      // a dweet waiting out of sight that has reported nothing for this long is replaced
     const MAX_SAMPLES = 32;          // most brightness samples taken from one update
     const MAX_MESSAGES_PER_SECOND = 60;
     const FLASHY_KEY = "dwitter.flashy";
@@ -34,7 +38,7 @@
     const RUNNER_CSP = "default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval'; style-src 'unsafe-inline'; img-src data: blob:; media-src data: blob:; form-action 'none'; base-uri 'none'";
 
     const bootedAt = performance.now();
-    const VERSION = "2026-10-16 background colour";
+    const VERSION = "2026-10-18 curtain";
     const CREDIT_PLACES = ["TOP_LEFT", "TOP_MIDDLE", "TOP_RIGHT", "BOTTOM_LEFT", "BOTTOM_MIDDLE", "BOTTOM_RIGHT"];
     const ATTRIBUTION_POSITIONS = CREDIT_PLACES.concat(["RANDOM", "OFF"]);
     const Selection = window.DwitterSelection;
@@ -49,6 +53,29 @@
         hintEl.textContent = "Some screensaver files could not be loaded (selection.js or health.js). Install the screensaver again.";
         hintEl.hidden = false;
         return;
+    }
+
+    // A black sheet above the dweets, and below the credit and the hints (which come later in the page). It does the jobs
+    // that making a dweet translucent would do, because a dweet must never be translucent: with GPU compositing, which is
+    // what a console's browser uses, a cross-origin frame that is partly transparent (or inside something that is) is
+    // drawn on top of an opaque white background, so a frame waiting at 1% opacity, or fading in, turns the whole screen
+    // white. So a frame that waits sits underneath the one on screen, the first one waits under the curtain, and the
+    // change from one dweet to the next dips through it. The properties are set here, not in main.css, so that they
+    // cannot be missing.
+    //
+    // The curtain is never quite opaque. A frame that is hidden behind something the browser knows to be opaque (a solid
+    // colour at 100%) stops getting animation frames, so a dweet under a fully black curtain never starts. At 99% the
+    // frames behind it keep running, and the picture that shows through (1%, about 2.5 levels out of 255) is still black
+    // to the eye. Frames never count as opaque themselves, so a frame can wait under another one.
+    const CURTAIN_DARK = 0.99;
+    const curtain = document.createElement("div");
+    curtain.id = "curtain";
+    Object.assign(curtain.style, { position: "fixed", top: "0", left: "0", width: "100%", height: "100%", background: "#000", opacity: String(CURTAIN_DARK), pointerEvents: "none" });
+    stage.insertAdjacentElement("afterend", curtain);
+
+    function setCurtain(opacity, ms, easing) {
+        curtain.style.transition = ms > 0 ? "opacity " + ms + "ms " + easing : "none";
+        curtain.style.opacity = String(opacity);
     }
 
     const storage = (function () {
@@ -133,6 +160,7 @@
             cfg.ROTATE_SECONDS = 5;
         }
         if (!isNumber(cfg.TRANSITION_MS) || cfg.TRANSITION_MS < 0 || cfg.TRANSITION_MS > 5000) fix("TRANSITION_MS", "should be between 0 and 5000.");
+        if (!isNumber(cfg.PRELOAD_SECONDS) || cfg.PRELOAD_SECONDS < 0 || cfg.PRELOAD_SECONDS > 60) fix("PRELOAD_SECONDS", "should be between 0 and 60.");
         if (!isNumber(cfg.MIN_FPS) || cfg.MIN_FPS < 0 || cfg.MIN_FPS > 60) fix("MIN_FPS", "should be between 0 and 60.");
         if (!isNumber(cfg.HINT_SECONDS) || cfg.HINT_SECONDS < 1 || cfg.HINT_SECONDS > 600) fix("HINT_SECONDS", "should be between 1 and 600.");
         if (cfg.FIT !== "contain" && cfg.FIT !== "cover") fix("FIT", 'should be "contain" or "cover".');
@@ -208,7 +236,10 @@
 
     const state = {
         current: null,       // the dweet on screen
-        pending: null,       // the dweet that is warming up behind it
+        pending: null,       // the dweet that is warming up behind it, out of sight
+        retiring: null,      // the dweet that is on its way out, still on screen while the screen goes dark
+        swap: null,          // what is done when the screen is dark during a change, or null when no change is going on
+        swapTimer: null,
         attempts: [],        // every iframe that exists
         timer: null,
         failures: 0,
@@ -287,11 +318,13 @@
         clearTimeout(attributionTimer);
         attributionEl.classList.remove("on");
         if (!text) return;
+        // The old credit fades out in half of TRANSITION_MS (the first half of the change), the new one fades in during the
+        // second half.
         attributionTimer = setTimeout(function () {
             placeCredit();
             attributionEl.textContent = text;
             attributionEl.classList.add("on");
-        }, cfg.TRANSITION_MS);
+        }, Math.round(cfg.TRANSITION_MS / 2) + CREDIT_MARGIN_MS);
     }
 
     function buildSrcdoc() {
@@ -385,6 +418,12 @@
         frame.setAttribute("tabindex", "-1");
         frame.setAttribute("aria-hidden", "true");
         frame.setAttribute("referrerpolicy", "no-referrer");
+        // Never translucent (see the curtain). Below the frame on screen, which is at z-index 1, so a new frame is hidden
+        // by it while it warms up; on top of it in the page, so it would be seen if this were not set. These are set
+        // here and not only in main.css so that an out-of-date style sheet cannot bring the old behaviour back.
+        frame.style.opacity = "1";
+        frame.style.transition = "none";
+        frame.style.zIndex = "0";
         if (runMode === "srcdoc" && typeof DwitterRunnerMain === "function") frame.srcdoc = buildSrcdoc();
         else frame.src = "runner.html";
         stage.appendChild(frame);
@@ -402,13 +441,28 @@
         return null;
     }
 
+    // The first half of a change: the old dweet is still on screen while the screen goes dark; the new dweet is shown during
+    // the second half.
+    const halfFade = () => Math.round(cfg.TRANSITION_MS / 2);
+
+    // How long the next dweet runs out of sight before it is shown, so that it is already underway when it is seen (many
+    // dweets start from an empty canvas and take seconds to build their picture). It is what PRELOAD_SECONDS asks for, or
+    // less when ROTATE_SECONDS is short, because the dweet being replaced has to be gone before the next one starts
+    // loading.
+    function preloadMs() {
+        if (!(cfg.ROTATE_SECONDS > 0)) return 0;
+        return Math.max(0, Math.min(cfg.PRELOAD_SECONDS * 1000, cfg.ROTATE_SECONDS * 1000 - halfFade() - FADE_MARGIN_MS));
+    }
+
     function scheduleRotation() {
         clearTimeout(state.timer);
         state.timer = null;
         const pinnedStays = pinned && !params.has("rotate");
         if (pinnedStays || !(cfg.ROTATE_SECONDS > 0) || document.hidden) return;
         if (!pinned && pool.length <= 1) return;
-        state.timer = setTimeout(startNext, cfg.ROTATE_SECONDS * 1000);
+        // The next dweet starts early and waits out of sight under this one until it is time to switch.
+        const lead = preloadMs();
+        state.timer = setTimeout(startNext, Math.max(cfg.ROTATE_SECONDS * 1000 - lead, halfFade() + FADE_MARGIN_MS));
     }
 
     function startNext() {
@@ -423,11 +477,18 @@
         const attempt = {
             rec,
             frame: createFrame(),
-            monitor: Health.createMonitor({ minFps: cfg.MIN_FPS, flashGuard: cfg.FLASH_GUARD }),
+            // The old dweet is still running while the screen goes dark, so the speed check starts after that.
+            monitor: Health.createMonitor({ minFps: cfg.MIN_FPS, flashGuard: cfg.FLASH_GUARD, fpsGraceMs: Math.max(1000, halfFade() + 500) }),
             revealed: false,
             dead: false,
             failed: false,
             readySeen: false,
+            settled: false,
+            // Nothing is on screen to fade from at first, so the first dweet is shown as soon as it has started. Any other
+            // one is shown after it has run out of sight for preloadMs() (the rotation timer starts it that long before
+            // the switch is due).
+            holdUntil: state.current ? performance.now() + preloadMs() : 0,
+            holdTimer: null,
             timeout: null,
             loads: 0,
             lastMessageAt: performance.now(),
@@ -506,16 +567,44 @@
             attempt.frame.contentWindow.postMessage({ type: "run", code: attempt.rec.code, background: cfg.BACKGROUND_COLOR }, "*");
         } else {
             const result = attempt.monitor.push(msg);
-            if (result && result.type === "ready") reveal(attempt);
+            if (result && result.type === "ready") settle(attempt);
             else if (result && result.type === "fail") fail(attempt, result);
         }
+    }
+
+    // A dweet that has started properly waits out of sight until it is time to switch (see PRELOAD_SECONDS).
+    function settle(attempt) {
+        if (attempt.settled || attempt.revealed || attempt.dead) return;
+        attempt.settled = true;
+        clearTimeout(attempt.timeout);
+        const wait = attempt.holdUntil - performance.now();
+        if (wait <= 0) {
+            reveal(attempt);
+            return;
+        }
+        log("d/" + attempt.rec.id + " is ready, showing it in " + (wait / 1000).toFixed(1) + " s");
+        attempt.holdTimer = setTimeout(function () {
+            if (attempt.revealed || attempt.dead) return;
+            // Nothing else is looking at a dweet that is not shown yet, so one that has gone quiet is not shown at all.
+            // (A hidden page makes every dweet quiet, which proves nothing.)
+            if (!document.hidden && performance.now() - attempt.lastMessageAt > HOLD_STALL_MS) fail(attempt, { reason: "stalled", detail: "no updates while waiting to be shown" });
+            else reveal(attempt);
+        }, wait);
+    }
+
+    // The dweet on screen is gone, so the one that is waiting is shown at once.
+    function release(attempt) {
+        attempt.holdUntil = 0;
+        if (attempt.settled) reveal(attempt);
     }
 
     function reveal(attempt) {
         if (attempt.revealed || attempt.dead) return;
         clearTimeout(attempt.timeout);
+        clearTimeout(attempt.holdTimer);
         attempt.revealed = true;
         attempt.monitor.reveal();
+        finishChange();
         const previous = state.current;
         state.current = attempt;
         renderAttribution();
@@ -524,30 +613,66 @@
         state.history = [];
         if (state.stickyHint) hideHint();
         if (state.autoSwitched && storage) saveRunMode(runMode);
-        attempt.frame.classList.remove("cut");
-        attempt.frame.classList.add("visible");
-        if (previous) retire(previous);
         state.rotations++;
         log("showing d/" + attempt.rec.id + " (" + state.rotations + ")");
+        change(previous, attempt);
         scheduleRotation();
+    }
+
+    // From one dweet to the next the screen dips through the curtain: it goes dark over the first half of TRANSITION_MS
+    // (the old dweet keeps running meanwhile), the frames are swapped while it is dark, and it lifts again over the second
+    // half. The first dweet, with nothing before it, only lifts. The dweet that comes next waited under the one on
+    // screen, so it is already running and nothing is loaded while the screen is dark.
+    function change(previous, attempt) {
+        const half = halfFade();
+        const swap = function () {
+            clearTimeout(state.swapTimer);
+            state.swap = null;
+            state.swapTimer = null;
+            attempt.frame.style.zIndex = "1";
+            attempt.frame.classList.add("visible");
+            if (previous) {
+                remove(previous);
+                state.retiring = null;
+            }
+            setCurtain(0, previous ? half : cfg.TRANSITION_MS, previous ? "ease-out" : "ease-in-out");
+        };
+        if (previous && half > 0) {
+            previous.dead = true;
+            state.retiring = previous;
+            state.swap = swap;
+            state.swapTimer = setTimeout(swap, half + 40);
+            setCurtain(CURTAIN_DARK, half, "ease-in");
+        } else {
+            swap();
+        }
+    }
+
+    // A change that is going on is completed at once, because another one is about to start.
+    function finishChange() {
+        if (state.swap) state.swap();
+    }
+
+    // The screen goes black at once and whatever was being changed is dropped: the dweet on screen was cut.
+    function blackout() {
+        clearTimeout(state.swapTimer);
+        state.swap = null;
+        state.swapTimer = null;
+        if (state.retiring) {
+            remove(state.retiring);
+            state.retiring = null;
+        }
+        setCurtain(CURTAIN_DARK, 0);
+        // So that the next change starts from black rather than from wherever the curtain was.
+        void curtain.offsetWidth;
     }
 
     function remove(attempt) {
         attempt.dead = true;
         clearTimeout(attempt.timeout);
+        clearTimeout(attempt.holdTimer);
         attempt.frame.remove();
         state.attempts = state.attempts.filter((a) => a !== attempt);
-    }
-
-    // The old dweet freezes and stays underneath while the new one fades in, then it is removed.
-    function retire(attempt) {
-        attempt.dead = true;
-        try {
-            attempt.frame.contentWindow.postMessage({ type: "stop" }, "*");
-        } catch (e) {
-            // The frame is going away anyway.
-        }
-        setTimeout(() => remove(attempt), cfg.TRANSITION_MS + 100);
     }
 
     // Used once, when the first way of running dweets does not start at all.
@@ -595,13 +720,14 @@
             return;
         }
         if (attempt.revealed) {
-            attempt.frame.classList.add("cut");
-            attempt.frame.classList.remove("visible");
             state.current = null;
             renderAttribution();
             remove(attempt);
+            blackout();
             state.failures = 0;
-            startNext();
+            // The next dweet may already be waiting out of sight: show it now rather than at its turn.
+            if (state.pending) release(state.pending);
+            else startNext();
             return;
         }
 
@@ -681,8 +807,11 @@
                     iframes: document.querySelectorAll("iframe").length,
                     nodes: document.getElementsByTagName("*").length,
                     current: state.current ? String(state.current.rec.id) : null,
+                    pending: state.pending ? String(state.pending.rec.id) : null,
                     pool: pool.length,
                     background: cfg.BACKGROUND_COLOR,
+                    curtain: Number(getComputedStyle(curtain).opacity),
+                    preloadMs: preloadMs(),
                     runMode,
                     timers: state.timer !== null ? 1 : 0,
                     databaseMs: state.databaseMs,
@@ -696,7 +825,7 @@
             const metrics = cur ? cur.monitor.metrics() : null;
             const lines = [
                 "d/" + (cur ? cur.rec.id + "  @" + cur.rec.username + "  " + cur.rec.awesome_count + " likes" : "-"),
-                "pool " + pool.length + "  mode " + runMode + "  shown " + state.rotations + (metrics ? "  frames " + metrics.frames + "  fps " + metrics.fps : ""),
+                "pool " + pool.length + "  mode " + runMode + "  shown " + state.rotations + (metrics ? "  frames " + metrics.frames + "  fps " + metrics.fps : "") + (state.pending ? "  next d/" + state.pending.rec.id : ""),
                 location.href.replace(/[?#].*/, ""),
                 "",
             ].concat(events.slice(-12));
@@ -740,7 +869,7 @@
     }
 
     document.body.classList.toggle("cover", cfg.FIT === "cover");
-    document.documentElement.style.setProperty("--fade", cfg.TRANSITION_MS + "ms");
+    document.documentElement.style.setProperty("--fade", halfFade() + "ms");
     window.addEventListener("message", onMessage);
     document.addEventListener("visibilitychange", onVisibility);
     window.addEventListener("pageshow", function (event) {
